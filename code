@@ -1,519 +1,398 @@
-# Imports
+# --- Imports ---
+# Standard library imports
+import io
+from datetime import timedelta, time, datetime # Ensure datetime is imported
+
+# Third-party imports
+import pandas as pd
+import pytz # For timezone handling
+
+# QuantConnect imports
 from AlgorithmImports import *
-from QuantConnect.DataSource import *
-from QuantConnect.Python import PythonData
-from QuantConnect import SymbolCache, Parse, Symbol # Added Symbol
-from QuantConnect.Data.Market import OptionChain, QuoteBar, TradeBar
-from QuantConnect.Orders.Fees import InteractiveBrokersFeeModel
-from QuantConnect.Orders.Slippage import ConstantSlippageModel
-from datetime import datetime, timedelta
-import csv
-import numpy as np
+#---------------------------------------------------------------------------------
 
-# ---------------------------------------------------------------
-# Custom Data Class Definition
-# ---------------------------------------------------------------
-class BotSignalData(PythonData):
-    """Custom data class to hold signals from the cleaned CSV file."""
-    SignalType = ""
-    Author = ""
+class OptionsSignalBacktest(QCAlgorithm):
+    """
+    Algorithm to backtest option trading signals from a CSV file.
 
-    def GetSource(self, config: SubscriptionDataConfig, date: datetime, isLiveMode: bool) -> SubscriptionDataSource:
-        """Specifies the location of the custom data source file."""
-        source = "cleaned_15min_data.csv" # Path in Object Store
-        return SubscriptionDataSource(source, SubscriptionTransportMedium.RemoteFile, FileFormat.Csv)
-
-    def Reader(self, config: SubscriptionDataConfig, line: str, date: datetime, isLiveMode: bool) -> BaseData:
-        """Parses a single line of the CSV file into a BotSignalData object."""
-        if not line or line.strip().startswith('Timestamp'): return None
-        reader = csv.reader([line]); data = next(reader, None)
-        if data is None or len(data) != 4: return None # Expecting Timestamp, Ticker, SignalType, Author
-
-        signal = BotSignalData()
-        try:
-            signal.Time = Parse.DateTime(data[0])
-
-            # <<< CORRECTED SYMBOL PARSING >>>
-            # Create the underlying equity Symbol object from the ticker string
-            ticker_string = data[1]
-            # Assume USA market for equities based on signals like SPY, AAPL etc.
-            signal.Symbol = Symbol.Create(ticker_string, SecurityType.Equity, Market.USA)
-            # <<< END CORRECTION >>>
-
-            signal.Value = 1
-            signal.SignalType = data[2]
-            signal.Author = data[3]
-            signal.EndTime = signal.Time
-        except Exception as e:
-            # Consider logging the error if self.Log was accessible here
-            # print(f"Error parsing line {line}: {e}") # Cannot print in QC cloud easily
-            return None # Skip row on error
-        return signal
-
-# ---------------------------------------------------------------
-# Main Algorithm Class
-# ---------------------------------------------------------------
-class OptionsSignalStrategy(QCAlgorithm):
+    Reads signals (Timestamp, Ticker, Signaltype) from 'cleaned_15min_data.csv'
+    in the Object Store. Enters single-leg Call/Put positions based on the latest
+    signal for each ticker, considering signals generated outside market hours.
+    Uses parameters for DTE, Delta, Take Profit %, and Stop Loss %.
+    """
 
     def Initialize(self):
-        '''Initialise the data, parameters, cash, and other settings for the algorithm.'''
+        """Initial algorithm setup."""
+        # --- Parameters ---
+        self.target_dte = self.GetParameter("dte", 0)        # Default 0 DTE
+        self.target_delta = self.GetParameter("delta", 0.70) # Default 0.70 delta
+        self.take_profit_pct = self.GetParameter("tp", 1.0)  # Default 100% TP
+        self.stop_loss_pct = self.GetParameter("sl", 0.0)    # Default 0% SL
+        # --- /Parameters ---
 
-        # --- Basic Setup ---
-        self.SetStartDate(2022, 4, 14)
-        self.SetEndDate(2025, 4, 5)
+        # --- Backtest Settings ---
+        self.SetStartDate(2022, 4, 14) # Match first data timestamp
+        self.SetEndDate(2025, 4, 5)   # Set to day after last data timestamp
         self.SetCash(100000)
-
-        # --- Strategy Parameters ---
-        self.dte_min = self.GetParameter("TargetDTE_Min", 0)
-        self.dte_max = self.GetParameter("TargetDTE_Max", 0)
-        self.target_delta = self.GetParameter("TargetDelta", 0.70)
-        self.sl_percent = self.GetParameter("StopLossPercent", 0.20)
-        self.tp_percent = self.GetParameter("TakeProfitPercent", 0.25)
-        self.max_allocation = self.GetParameter("MaxAllocationPerTrade", 0.10)
-        self.Log(f"Parameters: DTE={self.dte_min}-{self.dte_max}, Delta={self.target_delta}, SL={self.sl_percent:.2f}, TP={self.tp_percent:.2f}, Alloc={self.max_allocation:.2f}")
-
-        # --- Data Subscription ---
-        # Subscribe to SPY Equity to ensure OnData loop runs reliably
-        self.AddEquity("SPY", Resolution.Minute)
-        self.Log("Subscribed to SPY Equity data")
-        # Subscribe to Custom Signal Data
-        self.AddData(BotSignalData, "BotSignalData", Resolution.Minute)
-        self.Log("Subscribed to custom BotSignalData")
-
-        # --- Other Setup ---
-        self.exchange_tz = self.MarketHoursDatabase.GetExchangeHours(Market.USA, None, SecurityType.Equity).TimeZone
+        self.SetTimeZone("America/New_York")
         self.SetBrokerageModel(BrokerageName.InteractiveBrokersBrokerage, AccountType.Margin)
         self.SetSecurityInitializer(self.CustomSecurityInitializer)
+        # --- /Backtest Settings ---
 
-        # --- Tracking Dictionaries ---
-        self.current_positions = {}
-        self.option_chains = {}
-        self.open_orders = {}
-        self.ticker_stats = {}
-        self.ResetTradeStats()
+        # --- Data Loading and Preparation ---
+        self.signals_df = self._load_signals()
+        if self.signals_df is None or self.signals_df.empty:
+            self.Error("No signals loaded or error during loading. Stopping algorithm.")
+            self.Quit("Failed to load signals from Object Store.")
+            return
 
-        # --- Scheduled Actions ---
+        self.tickers = self.signals_df['Ticker'].str.upper().unique().tolist()
+        if not self.tickers:
+            self.Error("No tickers found in the signal file after processing. Stopping algorithm.")
+            self.Quit("No tickers available.")
+            return
+        self.Log(f"Tickers to trade based on signals: {self.tickers}")
+        # --- /Data Loading and Preparation ---
+
+        # --- State Variables ---
+        self.last_processed_signal_time = {ticker: None for ticker in self.tickers} # Stores pd.Timestamp
+        self.active_signal_type = {ticker: None for ticker in self.tickers}
+        self.current_option_symbol = {ticker: None for ticker in self.tickers} # Stores Option Symbol
+        self.option_entry_price = {ticker: 0.0 for ticker in self.tickers}
+        # --- /State Variables ---
+
+        # --- Universe and Data Setup ---
+        self.option_universe_settings = {}
+        required_resolution = Resolution.Minute
+        tickers_to_remove = []
+        for ticker in self.tickers:
+            try:
+                equity = self.AddEquity(ticker, resolution=required_resolution)
+                option = self.AddOption(ticker, resolution=required_resolution)
+                option.SetFilter(self._option_filter)
+                self.option_universe_settings[ticker] = {'equity_symbol': equity.Symbol}
+            except Exception as e:
+                self.Error(f"Error adding securities for {ticker}: {e}. Skipping this ticker.")
+                tickers_to_remove.append(ticker)
+
+        if tickers_to_remove:
+            for ticker in tickers_to_remove:
+                 self.tickers.remove(ticker)
+                 del self.last_processed_signal_time[ticker]
+                 del self.active_signal_type[ticker]
+                 del self.current_option_symbol[ticker]
+                 del self.option_entry_price[ticker]
+                 if ticker in self.option_universe_settings: del self.option_universe_settings[ticker]
+
+        if not self.tickers:
+             self.Error("No tickers were successfully added after setup attempts. Stopping algorithm.")
+             self.Quit("Failed to add any tickers.")
+             return
+        # --- /Universe and Data Setup ---
+
+        # --- Scheduled Events ---
         self.Schedule.On(self.DateRules.EveryDay(),
-                         self.TimeRules.BeforeMarketClose("SPY", 15),
-                         self.ClosePositionsBeforeMarketClose)
+                         self.TimeRules.At(9, 31),
+                         self.ProcessLatestPreMarketSignal)
+        # --- /Scheduled Events ---
+
+        self.SetWarmUp(timedelta(days=5))
+        self.Log("Initialization complete. Waiting for warmup period to finish.")
 
 
-    def ResetTradeStats(self):
-        """Reset the overall and per-ticker trade statistics"""
-        self.trade_stats = { "total_trades": 0, "winning_trades": 0, "losing_trades": 0, "total_profit": 0.0, "total_loss": 0.0, "largest_win": 0.0, "largest_loss": 0.0 }
-        self.ticker_stats = {}
+    def _load_signals(self) -> pd.DataFrame | None:
+        """Loads and preprocesses signals from the CSV file in the Object Store."""
+        object_store_key = "cleaned_15min_data.csv"
+        self.Log(f"Attempting to load signals from Object Store: '{object_store_key}'")
+        if not self.ObjectStore.ContainsKey(object_store_key):
+            self.Error(f"Object Store key '{object_store_key}' not found.")
+            return None
+        try:
+            csv_data = self.ObjectStore.ReadBytes(object_store_key)
+            df = pd.read_csv(io.BytesIO(csv_data))
+            self.Log(f"Successfully read {len(df)} rows from CSV file.")
+
+            # --- Data Cleaning ---
+            df.columns = [col.strip().lower() for col in df.columns]
+            required_cols = ['timestamp', 'ticker', 'signaltype']
+            if not all(col in df.columns for col in required_cols):
+                missing = [col for col in required_cols if col not in df.columns]
+                raise ValueError(f"CSV missing required columns: {missing}. Found: {df.columns.tolist()}")
+
+            df = df.rename(columns={'timestamp': 'Timestamp', 'ticker': 'Ticker', 'signaltype': 'SignalType'})
+            # Ensure Timestamp column is pandas Timestamp with UTC timezone
+            df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce', utc=True)
+
+            initial_rows = len(df); df = df.dropna(subset=['Timestamp']);
+            if len(df) < initial_rows: self.Log(f"Dropped {initial_rows - len(df)} rows due to invalid timestamps.")
+
+            df['SignalType'] = df['SignalType'].str.strip().str.capitalize()
+            valid_signals = ['Call', 'Put']; initial_rows = len(df); df = df[df['SignalType'].isin(valid_signals)];
+            if len(df) < initial_rows: self.Log(f"Dropped {initial_rows - len(df)} rows due to invalid SignalType.")
+
+            df['Ticker'] = df['Ticker'].str.strip().str.upper()
+            df = df.dropna(subset=['Ticker', 'SignalType'])
+            df = df.sort_values(by='Timestamp')
+            df = df[['Timestamp', 'Ticker', 'SignalType']]
+            # --- /Data Cleaning ---
+
+            self.Log(f"Loaded and processed {len(df)} valid signals.")
+            if not df.empty:
+                 self.Log(f"Signal Timestamp Range: {df['Timestamp'].min()} to {df['Timestamp'].max()}")
+                 self.Log(f"Sample signals:\n{df.head().to_string()}")
+            else:
+                 self.Log("No valid signals found after processing."); return None
+            return df
+        except Exception as e:
+            self.Error(f"Error loading/processing signals: {e}"); import traceback; self.Error(traceback.format_exc()); return None
 
 
     def CustomSecurityInitializer(self, security: Security):
-        """Initialize security-specific settings like fees and slippage"""
-        if security.Type == SecurityType.Option:
-            security.SetFeeModel(InteractiveBrokersFeeModel())
-            security.SetSlippageModel(ConstantSlippageModel(0.01))
+        """Applies custom settings to each security."""
+        security.SetSlippageModel(VolumeShareSlippageModel())
+        security.SetFeeModel(InteractiveBrokersFeeModel())
 
 
-    def OnData(self, slice: Slice):
-        '''Main event handler. Receives market data and custom data.'''
-        # Log entry into OnData for debugging flow (optional, can be verbose)
-        # self.Log(f"OnData called at {self.Time}")
-
-        # 1. Store latest option chain data
-        self.ProcessOptionChains(slice)
-
-        # 2. Process new signals
-        self.ProcessSignals(slice)
+    def _option_filter(self, filter_event: OptionFilterUniverse) -> OptionFilterUniverse:
+        """Basic filter for the option chain universe."""
+        min_dte = 0; max_dte = max(self.target_dte, 0) + 2;
+        return filter_event.Expiration(timedelta(days=min_dte), timedelta(days=max_dte))
 
 
-    def ProcessOptionChains(self, slice: Slice):
-        """Store the latest option chain data received in the slice"""
-        if not slice.OptionChains: return
-        for canonical_symbol, chain in slice.OptionChains.items():
-            if chain: self.option_chains[chain.Underlying] = chain
+    def ProcessLatestPreMarketSignal(self):
+        """Scheduled task to process the latest signal before market open."""
+        if self.IsWarmingUp: return
+        ny_zone = pytz.timezone("America/New_York"); utc_zone = pytz.utc;
+        try:
+            current_time_et = self.Time.astimezone(ny_zone)
+        except Exception as e: self.Error(f"Error converting self.Time to NY: {e}."); return
+        market_open_today_et = current_time_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        try:
+            if market_open_today_et.tzinfo is None: market_open_today_et = ny_zone.localize(market_open_today_et)
+            market_open_today_utc = market_open_today_et.astimezone(utc_zone) # Python datetime object
+            # --- Timestamp Conversion ---
+            # Convert to pandas Timestamp for consistent comparison
+            market_open_today_ts = pd.Timestamp(market_open_today_utc)
+            # --- /Timestamp Conversion ---
+        except Exception as e: self.Error(f"Error converting market open ET to UTC/Timestamp: {e}."); return
+
+        self.Log(f"--- Market Open Signal Check @ {current_time_et} ET ({self.Time} UTC) ---")
+        for ticker in self.tickers:
+            ticker_signals = self.signals_df[self.signals_df['Ticker'] == ticker]
+            # Compare Series[pd.Timestamp UTC] < pd.Timestamp [UTC]
+            try:
+                pre_market_signals = ticker_signals[ticker_signals['Timestamp'] < market_open_today_ts]
+            except TypeError as e:
+                self.Error(f"Comparison TypeError in ProcessLatestPreMarketSignal: {e}")
+                self.Error(f"Comparing Series dtype: {ticker_signals['Timestamp'].dtype}")
+                self.Error(f"with scalar type: {type(market_open_today_ts)} ({market_open_today_ts})")
+                continue # Skip ticker if comparison fails
+
+            if not pre_market_signals.empty:
+                latest_pre_market_signal = pre_market_signals.iloc[-1]
+                signal_time = latest_pre_market_signal['Timestamp'] # pd.Timestamp
+                signal_type = latest_pre_market_signal['SignalType']
+                last_processed_time = self.last_processed_signal_time[ticker] # None or pd.Timestamp
+                if last_processed_time is None or signal_time > last_processed_time:
+                    self.Log(f"{ticker}: Pre-Market Action -> Signal: {signal_type} @ {signal_time}. Processing.")
+                    self._execute_trade_logic(ticker, signal_type, signal_time)
 
 
-    def ProcessSignals(self, slice: Slice):
-        """Process new trading signals from custom data"""
-        signals = slice.Get(BotSignalData)
-        if not signals: return # Exit if no signals in this slice
+    def OnData(self, data: Slice):
+        """Main event handler for processing data and managing trades."""
+        if self.IsWarmingUp: return
 
-        # Log that signals were found in this slice
-        self.Log(f"DEBUG ProcessSignals: Found {len(signals)} signal object(s) in this slice. Processing...")
+        # Use pd.Timestamp for internal logic consistency and comparisons
+        # self.Time is datetime UTC, pd.Timestamp converts it correctly
+        current_utc_time_ts = pd.Timestamp(self.Time) # pd.Timestamp UTC
 
-        # Process each signal received
-        for symbol_mapped_name, signal_data in signals.items():
-            underlying_symbol = signal_data.Symbol # This is now a correctly formed Symbol object
-            signal_type = signal_data.SignalType # 'Call' or 'Put'
-            ticker_str = underlying_symbol.Value
+        # --- Market Open Check ---
+        try:
+            first_ticker_symbol = self.option_universe_settings[self.tickers[0]]['equity_symbol']
+            if not self.Securities[first_ticker_symbol].Exchange.ExchangeOpen: return
+        except (IndexError, KeyError) as e: self.Error(f"Error checking market hours: {e}"); return
+        # --- /Market Open Check ---
 
-            # Initialize ticker stats if first time seeing this ticker
-            if ticker_str not in self.ticker_stats:
-                self.ticker_stats[ticker_str] = { "total_trades": 0, "winning_trades": 0, "losing_trades": 0, "total_profit": 0.0, "total_loss": 0.0, "net_pnl": 0.0 }
+        for ticker in self.tickers:
+            # --- Process New Intra-day Signals ---
+            last_processed_time_ts = self.last_processed_signal_time[ticker] # Should be None or pd.Timestamp
+            if last_processed_time_ts is None:
+                 start_date_utc = self.StartDate
+                 if start_date_utc.tzinfo is None: start_date_utc = pytz.utc.localize(start_date_utc)
+                 elif start_date_utc.tzinfo != pytz.utc: start_date_utc = start_date_utc.astimezone(pytz.utc)
+                 last_processed_time_ts = pd.Timestamp(start_date_utc) # pd.Timestamp
 
-            self.Log(f"SIGNAL RECEIVED: Time={self.Time}, Underlying={ticker_str}, Type={signal_type}")
+            ticker_signals = self.signals_df[self.signals_df['Ticker'] == ticker]
 
-            # Ensure data subscriptions are active and data is available
-            if not self.EnsureDataSubscription(underlying_symbol, slice):
-                self.Log(f"Data not ready for {ticker_str}, skipping signal processing this cycle.")
+            # Compare Series[pd.Timestamp UTC] with pd.Timestamp UTC for both sides
+            try:
+                new_signals = ticker_signals[
+                    (ticker_signals['Timestamp'] > last_processed_time_ts) & # Compare Series[UTC] > Timestamp[UTC]
+                    (ticker_signals['Timestamp'] <= current_utc_time_ts)    # Compare Series[UTC] <= Timestamp[UTC]
+                ]
+            except TypeError as e:
+                # Log detailed error if comparison still fails
+                self.Error(f"Comparison TypeError in OnData: {e}")
+                self.Error(f"Comparing Series dtype: {ticker_signals['Timestamp'].dtype} ({ticker_signals['Timestamp'].iloc[0] if not ticker_signals.empty else 'N/A'})")
+                self.Error(f"with scalar types: {type(last_processed_time_ts)} ({last_processed_time_ts}) and {type(current_utc_time_ts)} ({current_utc_time_ts})")
+                continue # Skip to next ticker if comparison fails
+
+            if not new_signals.empty:
+                latest_new_signal = new_signals.iloc[-1]
+                signal_time = latest_new_signal['Timestamp'] # pd.Timestamp
+                signal_type = latest_new_signal['SignalType']
+                self.Log(f"{ticker}: Intra-Day Action -> Signal: {signal_type} @ {signal_time}. Processing.")
+                # Pass the pandas Timestamp signal_time
+                self._execute_trade_logic(ticker, signal_type, signal_time)
                 continue
 
-            # --- Reversal Logic ---
-            if underlying_symbol in self.current_positions:
-                current_signal_type = self.current_positions[underlying_symbol].get('signal_type')
-                if current_signal_type != signal_type:
-                    self.Log(f"Reversal signal: Closing existing {current_signal_type} position for {ticker_str} before processing new {signal_type} signal.")
-                    self.ClosePosition(underlying_symbol)
-                else:
-                    self.Log(f"Ignoring signal: Received {signal_type} signal for {ticker_str}, but already holding a {current_signal_type} position.")
-                    continue
+            # --- Manage Open Position ---
+            option_symbol = self.current_option_symbol[ticker] # This is the Option Symbol object
+            if option_symbol and self.Portfolio[option_symbol].Invested:
+                option_holding = self.Portfolio[option_symbol]
+                current_price = option_holding.Price
+                entry_price = self.option_entry_price[ticker]
+                if entry_price <= 0: self.Debug(f"{ticker}: Entry price {entry_price} invalid. Skipping TP/SL."); continue
 
-            # --- Entry Logic ---
-            if underlying_symbol not in self.current_positions:
-                self.Log(f"Attempting entry for {ticker_str} {signal_type}")
-                contract_symbol = self.FindOptionContract(underlying_symbol, signal_type)
-                if contract_symbol is None:
-                    continue
-
-                qty = self.CalculatePositionSize(contract_symbol)
-                if qty <= 0:
-                    continue
-
-                entry_order_id = self.PlaceOptionOrder(contract_symbol, qty)
-                if entry_order_id <= 0:
-                    continue
-
-                self.current_positions[underlying_symbol] = {
-                    'contract': contract_symbol, 'quantity': qty, 'entry_price': None,
-                    'entry_time': self.Time, 'signal_type': signal_type, 'ticker': ticker_str,
-                    'entry_order_id': entry_order_id, 'sl_order_id': None, 'tp_order_id': None
-                }
-                self.Log(f"Placed entry order ID {entry_order_id} for {qty} contracts of {contract_symbol}")
+                # Check TP / SL (rest is unchanged)
+                if self.take_profit_pct > 0:
+                    tp_price = entry_price * (1 + self.take_profit_pct)
+                    if current_price >= tp_price:
+                        self.Log(f"{ticker}: TAKE PROFIT @ {current_price:.2f} (Entry: {entry_price:.2f}, Target: {tp_price:.2f})")
+                        self.Liquidate(option_symbol, f"Take Profit @ {current_price:.2f}"); self._reset_position_tracking(ticker); continue
+                if self.stop_loss_pct > 0:
+                    sl_price = entry_price * (1 - self.stop_loss_pct)
+                    if current_price <= sl_price:
+                        self.Log(f"{ticker}: STOP LOSS @ {current_price:.2f} (Entry: {entry_price:.2f}, Target: {sl_price:.2f})")
+                        self.Liquidate(option_symbol, f"Stop Loss @ {current_price:.2f}"); self._reset_position_tracking(ticker); continue
 
 
-    def EnsureDataSubscription(self, underlying_symbol, slice: Slice):
-        """Ensure we have Equity and Option data subscriptions and data is available"""
-        equity_subscribed = self.Securities.ContainsKey(underlying_symbol)
-        canonical_option = Symbol.CreateOption(underlying_symbol, Market.USA, OptionStyle.American)
-        option_subscribed = self.Securities.ContainsKey(canonical_option)
-        needs_equity = not equity_subscribed
-        needs_option = not option_subscribed
+    def _execute_trade_logic(self, ticker: str, signal_type: str, signal_time: pd.Timestamp):
+        """Core logic to execute a trade based on a new signal."""
+        self.Log(f"Executing trade logic for {ticker}: Signal={signal_type}, Time={signal_time}")
 
-        if needs_equity:
-            self.AddEquity(underlying_symbol.Value, Resolution.Minute)
-            self.Log(f"Added equity subscription for {underlying_symbol.Value}")
-        if needs_option:
-             option_symbol = self.AddOption(underlying_symbol.Value, Resolution.Minute)
-             filter_end_dte = max(1, self.dte_max) + 7
-             option_symbol.SetFilter(-10, 10, timedelta(days=0), timedelta(days=filter_end_dte))
-             self.Log(f"Added option chain subscription for {underlying_symbol.Value}")
+        # Update Last Processed Time (ensure pd.Timestamp)
+        self.last_processed_signal_time[ticker] = pd.Timestamp(signal_time)
 
-        if needs_equity or needs_option: return False
+        # Check if Signal Requires Action
+        current_symbol = self.current_option_symbol[ticker]
+        if self.active_signal_type[ticker] == signal_type and current_symbol and self.Portfolio[current_symbol].Invested:
+             self.Log(f"{ticker}: Signal type ({signal_type}) same as active. No change."); return
 
-        if not self.Securities[underlying_symbol].HasData: return False
-        if underlying_symbol not in slice.OptionChains: return False
-        if not slice.OptionChains[underlying_symbol]: return False
-        return True
+        # Liquidate Existing Position
+        if current_symbol and self.Portfolio[current_symbol].Invested:
+            self.Log(f"{ticker}: Liquidating {current_symbol.Value} due to new signal '{signal_type}'.")
+            self.Liquidate(current_symbol, f"New signal {signal_type}"); self._reset_position_tracking(ticker)
 
+        # Find Target Option Contract (returns a Symbol object or None)
+        target_option_symbol = self._find_option_contract(ticker, option_right = OptionRight.Call if signal_type == 'Call' else OptionRight.Put)
 
-    def FindOptionContract(self, underlying_symbol, signal_type):
-        """Find the appropriate option contract Symbol based on DTE and Delta parameters"""
-        if underlying_symbol not in self.option_chains: return None
-
-        chain = self.option_chains[underlying_symbol]
-        option_right = OptionRight.Call if signal_type == "Call" else OptionRight.Put
-        try:
-             now_date = self.Securities[underlying_symbol].Exchange.Time.date()
-        except:
-             now_date = self.Time.astimezone(self.MarketHoursDatabase.GetExchangeHours(Market.USA, underlying_symbol, SecurityType.Equity).TimeZone).date()
-
-        filtered_contracts = []
-        for contract in chain:
-            if contract.Right != option_right: continue
-            dte = (contract.Expiry.date() - now_date).days
-            if self.dte_min <= dte <= self.dte_max:
-                 filtered_contracts.append(contract)
-
-        if not filtered_contracts:
-            self.Log(f"FindOptionContract: No contracts found for {underlying_symbol.Value} Right={option_right} DTE={self.dte_min}-{self.dte_max}")
-            return None
-
-        best_contract = None
-        closest_delta_diff = float('inf')
-        for contract in filtered_contracts:
-            contract_security = self.Securities.get(contract.Symbol)
-            if contract_security and contract_security.Price > 0 and \
-               contract.Greeks.Delta is not None and abs(contract.Greeks.Delta) > 1e-6:
-                contract_delta = abs(contract.Greeks.Delta)
-                delta_diff = abs(contract_delta - self.target_delta)
-                if delta_diff < closest_delta_diff:
-                    closest_delta_diff = delta_diff
-                    best_contract = contract
-
-        if best_contract is None:
-             self.Log(f"FindOptionContract: Could not find contract near Delta {self.target_delta} for {underlying_symbol.Value} among {len(filtered_contracts)} DTE-filtered contracts.")
-             return None
-
-        selected_dte = (best_contract.Expiry.date() - now_date).days
-        self.Log(f"FindOptionContract: Selected {best_contract.Symbol} DTE={selected_dte} Delta={best_contract.Greeks.Delta:.3f} (Diff={closest_delta_diff:.3f})")
-        return best_contract.Symbol
-
-
-    def CalculatePositionSize(self, contract_symbol):
-        """Calculate order quantity based on max allocation parameter"""
-        if not self.Securities.ContainsKey(contract_symbol): return 0
-        price = self.Securities[contract_symbol].Price
-        if price <= 0: return 0
-        quantity = self.CalculateOrderQuantity(contract_symbol, self.max_allocation)
-        return int(quantity) if quantity and quantity != 0 else 0
-
-
-    def PlaceOptionOrder(self, contract_symbol, quantity):
-        """Place Market order and track it"""
-        order_ticket = self.MarketOrder(contract_symbol, quantity)
-        if order_ticket.Status == OrderStatus.Invalid:
-            self.Log(f"ERROR: Market order for {contract_symbol} was invalid: {order_ticket.GetMostRecentOrderResponse().ErrorCode}")
-            return 0
+        # Place Order if Contract Symbol Found
+        if target_option_symbol:
+            self.Log(f"{ticker}: Found {target_option_symbol.Value}. Placing order.")
+            # Use the found Symbol object directly in MarketOrder
+            order_ticket = self.MarketOrder(target_option_symbol, 1)
+            if order_ticket.Status == OrderStatus.Invalid:
+                 self.Error(f"{ticker}: Order for {target_option_symbol} FAILED: {order_ticket.GetErrorMessage()}"); self._reset_position_tracking(ticker)
+            else:
+                 self.active_signal_type[ticker] = signal_type
+                 # Store the Symbol object of the contract we are trading
+                 self.current_option_symbol[ticker] = target_option_symbol
+                 self.option_entry_price[ticker] = 0.0;
+                 self.Log(f"{ticker}: Order submitted for {target_option_symbol}. ID: {order_ticket.OrderId}")
         else:
-            self.open_orders[order_ticket.OrderId] = {'contract': contract_symbol, 'quantity': quantity, 'type': 'entry'}
-            return order_ticket.OrderId
+            self.Log(f"{ticker}: No suitable {signal_type} contract found. No trade."); self._reset_position_tracking(ticker)
 
 
-    def ClosePosition(self, underlying_symbol):
-        """Place Market order to close any existing position for the underlying"""
-        if underlying_symbol not in self.current_positions: return
-        position_info = self.current_positions[underlying_symbol]
-        contract_symbol = position_info['contract']
-        portfolio_holding = self.Portfolio[contract_symbol]
-        current_qty = portfolio_holding.Quantity
-        if current_qty == 0:
-            self.CancelPendingStopTakeProfitOrders(position_info)
-            if underlying_symbol in self.current_positions: del self.current_positions[underlying_symbol]
-            return
+    def _find_option_contract(self, ticker: str, option_right: OptionRight) -> Symbol | None:
+        """
+        Finds the single best option contract Symbol matching the criteria.
+        Returns the Symbol object or None.
+        """
+        try: underlying_symbol = self.option_universe_settings[ticker]['equity_symbol']
+        except KeyError: self.Error(f"Ticker '{ticker}' not found in settings."); return None
+        if underlying_symbol not in self.Securities or not self.Securities[underlying_symbol].HasData: self.Log(f"Warning: Underlying data unavailable for {ticker} at {self.Time}."); return None
+        underlying_price = self.Securities[underlying_symbol].Price
+        if underlying_price <= 0: self.Log(f"Warning: Underlying price {underlying_price} invalid for {ticker} at {self.Time}."); return None
 
-        self.Log(f"Closing position for {underlying_symbol.Value} (Contract: {contract_symbol}) with quantity {current_qty}")
-        close_qty = -current_qty
-        order_ticket = self.MarketOrder(contract_symbol, close_qty)
-        if order_ticket.Status != OrderStatus.Invalid:
-            self.open_orders[order_ticket.OrderId] = {'contract': contract_symbol, 'quantity': close_qty, 'type': 'exit'}
-            self.CancelPendingStopTakeProfitOrders(position_info)
-        else:
-            self.Log(f"ERROR: Failed to place closing order for {contract_symbol}: {order_ticket.GetMostRecentOrderResponse().ErrorCode}")
+        chain_symbols = self.OptionChainProvider.GetOptionContractList(underlying_symbol, self.Time)
+        if not chain_symbols: self.Debug(f"No option chain symbols for {ticker} at {self.Time}"); return None
 
+        symbols_of_type = [s for s in chain_symbols if s.ID.OptionRight == option_right]
+        if not symbols_of_type: self.Debug(f"No {option_right.name} contract symbols found for {ticker}"); return None
 
-    def PlaceStopLossAndTakeProfit(self, underlying_symbol):
-        """Place SL/TP bracket orders after entry fill"""
-        if underlying_symbol not in self.current_positions: return
-        position = self.current_positions[underlying_symbol]
-        contract_symbol = position['contract']
-        quantity = self.Portfolio[contract_symbol].Quantity
-        entry_price = position['entry_price']
-        if quantity == 0: return
-        if entry_price is None or entry_price <= 0:
-            self.Log(f"ERROR: Cannot place SL/TP for {contract_symbol}. Invalid entry price ({entry_price}).")
-            return
-        close_quantity = -quantity
+        # Filter Symbols by DTE
+        target_expiry_dt = self.Time.date() + timedelta(days=self.target_dte); min_dte_diff = float('inf'); closest_expiry_date = None;
+        available_expiries = sorted(list(set(symbol.ID.Date.date() for symbol in symbols_of_type)))
+        for expiry_date in available_expiries:
+            dte = (expiry_date - self.Time.date()).days; dte_diff = abs(dte - self.target_dte);
+            if dte_diff < min_dte_diff: min_dte_diff = dte_diff; closest_expiry_date = expiry_date;
+            elif dte_diff == min_dte_diff and (closest_expiry_date is None or expiry_date < closest_expiry_date): closest_expiry_date = expiry_date;
+        if closest_expiry_date is None: self.Log(f"{ticker}: Could not find expiry near DTE {self.target_dte}."); return None
+        symbols_at_expiry = [s for s in symbols_of_type if s.ID.Date.date() == closest_expiry_date]
+        actual_dte = (closest_expiry_date - self.Time.date()).days; self.Debug(f"{ticker}: Selected expiry {closest_expiry_date} (DTE: {actual_dte})")
 
-        if self.sl_percent > 0:
-            stop_price = round(entry_price * (1 - self.sl_percent) if position['signal_type'] == 'Call' else entry_price * (1 + self.sl_percent), 2)
-            if stop_price >= 0.01:
-                sl_ticket = self.StopMarketOrder(contract_symbol, close_quantity, stop_price)
-                if sl_ticket.Status != OrderStatus.Invalid:
-                    position['sl_order_id'] = sl_ticket.OrderId
-                    self.open_orders[sl_ticket.OrderId] = {'contract': contract_symbol, 'quantity': close_quantity, 'type': 'stop_loss'}
-                    self.Log(f"Placed Stop Loss order ID {sl_ticket.OrderId} for {contract_symbol} at {stop_price:.2f}")
-                else: self.Log(f"ERROR placing SL order for {contract_symbol}: {sl_ticket.GetMostRecentOrderResponse().ErrorCode}")
-            else: self.Log(f"WARNING: Invalid stop price ({stop_price:.2f}) for {contract_symbol}. SL not placed.")
+        # Filter Symbols by Delta and Liquidity
+        target_delta_abs = abs(self.target_delta); best_symbol = None; min_delta_diff = float('inf');
+        symbols_at_expiry.sort(key=lambda s: abs(s.ID.StrikePrice - underlying_price))
 
-        if self.tp_percent > 0 and self.tp_percent < 999:
-            limit_price = round(entry_price * (1 + self.tp_percent) if position['signal_type'] == 'Call' else entry_price * (1 - self.tp_percent), 2)
-            if limit_price >= 0.01:
-                tp_ticket = self.LimitOrder(contract_symbol, close_quantity, limit_price)
-                if tp_ticket.Status != OrderStatus.Invalid:
-                    position['tp_order_id'] = tp_ticket.OrderId
-                    self.open_orders[tp_ticket.OrderId] = {'contract': contract_symbol, 'quantity': close_quantity, 'type': 'take_profit'}
-                    self.Log(f"Placed Take Profit order ID {tp_ticket.OrderId} for {contract_symbol} at {limit_price:.2f}")
-                else: self.Log(f"ERROR placing TP order for {contract_symbol}: {tp_ticket.GetMostRecentOrderResponse().ErrorCode}")
-            else: self.Log(f"WARNING: Invalid limit price ({limit_price:.2f}) for {contract_symbol}. TP not placed.")
+        for symbol in symbols_at_expiry: # Iterate through SYMBOL objects
+            if symbol not in self.Securities: self.Debug(f"{symbol.Value} not in Securities collection yet."); continue
+            option_security = self.Securities[symbol] # Get the Security object
 
+            # Ensure we have an OptionContract object, not the parent Option chain object
+            if not isinstance(option_security, OptionContract):
+                self.Debug(f"Skipping {symbol.Value}: Security object is not an OptionContract (Type: {type(option_security)}).")
+                continue
 
-    def CancelPendingStopTakeProfitOrders(self, position_info):
-        """Cancel open SL/TP orders associated with a position info dictionary"""
-        sl_order_id = position_info.get('sl_order_id')
-        tp_order_id = position_info.get('tp_order_id')
-        open_tickets = self.Transactions.GetOpenOrderTickets(lambda ticket: ticket.OrderId == sl_order_id or ticket.OrderId == tp_order_id)
-        for ticket in open_tickets:
-            try:
-                ticket.Cancel(f"Cancelling bracket order {ticket.OrderId}")
-                self.Log(f"Cancelled pending order ID {ticket.OrderId}")
-                if ticket.OrderId in self.open_orders: del self.open_orders[ticket.OrderId]
-            except Exception as e: self.Log(f"Error cancelling order {ticket.OrderId}: {e}")
+            if not option_security.HasData: self.Debug(f"{symbol.Value} Security object has no data yet."); continue
+
+            # Check liquidity using the Security object
+            if option_security.Price <= 0 or option_security.AskPrice <= 0 or option_security.BidPrice <= 0: self.Debug(f"Skipping {symbol.Value}: Illiquid."); continue
+
+            # Get Greeks from the Security object (should exist if it's an OptionContract)
+            greeks = option_security.Greeks
+            if greeks.Delta == 0 and underlying_price > 0: self.Debug(f"Skipping {symbol.Value}: Delta is zero."); continue
+
+            contract_delta_abs = abs(greeks.Delta); delta_diff = abs(contract_delta_abs - target_delta_abs);
+            if delta_diff < min_delta_diff: min_delta_diff = delta_diff; best_symbol = symbol; # Store the best SYMBOL
+
+        if best_symbol:
+             final_greeks = self.Securities[best_symbol].Greeks
+             self.Debug(f"{ticker}: Selected {best_symbol.Value} (Strike:{best_symbol.ID.StrikePrice}, Delta:{final_greeks.Delta:.3f}, Target:~{self.target_delta:.2f}, DTE:{actual_dte})")
+        else: self.Log(f"{ticker}: No suitable contract found near Delta {self.target_delta} for expiry {closest_expiry_date}.")
+
+        return best_symbol
 
 
     def OnOrderEvent(self, orderEvent: OrderEvent):
-        '''Event handler for order status changes'''
-        order_id = orderEvent.OrderId
-        if orderEvent.Status == OrderStatus.Filled or orderEvent.Status >= OrderStatus.Canceled:
-             fill_price_str = f"{orderEvent.FillPrice:.2f}" if orderEvent.Status == OrderStatus.Filled else "N/A"
-             self.Log(f"ORDER EVENT: Time={self.Time}, OrderId={order_id}, Symbol={orderEvent.Symbol}, Status={orderEvent.Status}, Quantity={orderEvent.Quantity}, FillPrice={fill_price_str}, Msg={orderEvent.Message}")
+        """Handles order events to record entry price."""
+        order = self.Transactions.GetOrderById(orderEvent.OrderId)
+        if orderEvent.Status != OrderStatus.Filled and orderEvent.Status != OrderStatus.PartiallyFilled: return
+        if order.SecurityType != SecurityType.Option: return
+        ticker = order.Symbol.Underlying.Value
 
-        if orderEvent.Status == OrderStatus.Filled:
-            order_info = self.open_orders.pop(order_id, None)
-            if order_info: self.HandleFilledOrder(orderEvent, order_info)
-            else:
-                if orderEvent.Symbol.SecurityType == SecurityType.Option and \
-                   orderEvent.Message and ("assignment" in orderEvent.Message.lower() or "exercise" in orderEvent.Message.lower()):
-                    self.Log(f"Option Assignment/Exercise Event: {orderEvent.Symbol}")
-                    underlying_symbol = orderEvent.Symbol.Underlying
-                    if underlying_symbol in self.current_positions and self.current_positions[underlying_symbol]['contract'] == orderEvent.Symbol:
-                        del self.current_positions[underlying_symbol]
-                        self.Log(f"Removed assigned/exercised position from tracking: {underlying_symbol.Value}")
-
-        elif order_id in self.open_orders and orderEvent.Status in [OrderStatus.Canceled, OrderStatus.Invalid]:
-             del self.open_orders[order_id]
+        if ticker in self.current_option_symbol and order.Symbol == self.current_option_symbol[ticker]:
+            if order.Direction == OrderDirection.Buy:
+                 current_holding = self.Portfolio[order.Symbol]; total_quantity_after_fill = current_holding.AbsoluteQuantity;
+                 fill_quantity_this_event = orderEvent.FillQuantity; fill_price_this_event = orderEvent.FillPrice;
+                 quantity_before_this_fill = total_quantity_after_fill - fill_quantity_this_event;
+                 cost_before_this_fill = self.option_entry_price[ticker] * quantity_before_this_fill;
+                 cost_of_this_fill = fill_quantity_this_event * fill_price_this_event;
+                 if total_quantity_after_fill != 0: new_average_price = (cost_before_this_fill + cost_of_this_fill) / total_quantity_after_fill
+                 else: self.Error(f"Calc avg price error for {order.Symbol}"); new_average_price = fill_price_this_event; # Fallback
+                 self.option_entry_price[ticker] = new_average_price
+                 self.Log(f"{ticker}: BUY Fill {order.Symbol}. Qty:{fill_quantity_this_event}, Price:{fill_price_this_event:.4f}. New Avg Entry:{new_average_price:.4f}, Total Qty:{total_quantity_after_fill}")
 
 
-    def HandleFilledOrder(self, orderEvent, order_info):
-        """Handle filled orders - update positions and manage related orders"""
-        order_id = orderEvent.OrderId
-        order_type = order_info['type']
-        contract_symbol = order_info['contract']
-        underlying_symbol = contract_symbol.Underlying
-
-        if order_type == 'entry':
-            if underlying_symbol in self.current_positions:
-                position = self.current_positions[underlying_symbol]
-                if position['entry_order_id'] == order_id:
-                    position['entry_price'] = orderEvent.FillPrice
-                    self.Log(f"Entry order {order_id} filled for {contract_symbol} at {orderEvent.FillPrice:.2f}")
-                    self.PlaceStopLossAndTakeProfit(underlying_symbol)
-
-        elif order_type in ['exit', 'stop_loss', 'take_profit']:
-            if underlying_symbol in self.current_positions:
-                position = self.current_positions[underlying_symbol]
-                if position['contract'] == contract_symbol:
-                    entry_price = position['entry_price']
-                    exit_price = orderEvent.FillPrice
-                    filled_quantity = abs(orderEvent.Quantity)
-                    ticker = position['ticker']
-                    if entry_price is not None and entry_price > 0:
-                        trade_pnl = (exit_price - entry_price) * filled_quantity * 100
-                        if position['signal_type'] == "Put": trade_pnl = -trade_pnl
-                        self.RecordTradeStats(trade_pnl, position, ticker, exit_price, filled_quantity)
-                    else:
-                        self.Log(f"WARNING: Cannot calc PnL for closed {contract_symbol}. Missing entry price.")
-
-                    portfolio_qty_after_fill = self.Portfolio[contract_symbol].Quantity
-                    if portfolio_qty_after_fill == 0:
-                         self.Log(f"Position for {underlying_symbol.Value} fully closed by {order_type} order {order_id}.")
-                         if order_type == 'stop_loss': self.CancelPendingStopTakeProfitOrders({'tp_order_id': position.get('tp_order_id')})
-                         elif order_type == 'take_profit': self.CancelPendingStopTakeProfitOrders({'sl_order_id': position.get('sl_order_id')})
-                         if underlying_symbol in self.current_positions: del self.current_positions[underlying_symbol]
-                         self.Log(f"Removed position for {underlying_symbol.Value} from tracking.")
-
-
-    def RecordTradeStats(self, trade_pnl, position, ticker, exit_price, quantity):
-        """Record statistics for a completed trade portion"""
-        if position['entry_price'] is None: return
-
-        self.trade_stats["total_trades"] += 1
-        if trade_pnl > 0:
-            self.trade_stats["winning_trades"] += 1
-            self.trade_stats["total_profit"] += trade_pnl
-            self.trade_stats["largest_win"] = max(self.trade_stats["largest_win"], trade_pnl)
-        else:
-            self.trade_stats["losing_trades"] += 1
-            self.trade_stats["total_loss"] += abs(trade_pnl)
-            self.trade_stats["largest_loss"] = max(self.trade_stats["largest_loss"], abs(trade_pnl))
-        if ticker in self.ticker_stats:
-            stats = self.ticker_stats[ticker]
-            stats["total_trades"] += 1
-            stats["net_pnl"] += trade_pnl
-            if trade_pnl > 0: stats["winning_trades"] += 1; stats["total_profit"] += trade_pnl
-            else: stats["losing_trades"] += 1; stats["total_loss"] += abs(trade_pnl)
-
-        self.Log(f"TRADE RECORD: Fill for {quantity} of {position['contract']}, Type: {position['signal_type']}, " +
-                 f"Entry: {position['entry_price']:.2f}, Exit: {exit_price:.2f}, " +
-                 f"Fill P&L: ${trade_pnl:.2f}, Overall Trade Count: {self.trade_stats['total_trades']}")
-
-        if self.trade_stats["total_trades"] > 0:
-            win_rate = self.trade_stats["winning_trades"] / self.trade_stats["total_trades"] * 100
-            self.Plot("Trade Stats", "Win Rate (%)", win_rate)
-            net_profit = self.trade_stats["total_profit"] - self.trade_stats["total_loss"]
-            self.Plot("Trade Stats", "Net Profit ($)", net_profit)
-            profit_factor = self.trade_stats["total_profit"] / self.trade_stats["total_loss"] if self.trade_stats["total_loss"] > 0 else float('inf')
-            plot_pf = 100 if profit_factor == float('inf') else profit_factor if profit_factor < 100 else 100
-            self.Plot("Trade Stats", "Profit Factor", plot_pf)
+    def _reset_position_tracking(self, ticker: str):
+        """Resets state variables for a ticker."""
+        self.Debug(f"Resetting state for {ticker}")
+        self.active_signal_type[ticker] = None; self.current_option_symbol[ticker] = None; self.option_entry_price[ticker] = 0.0;
 
 
     def OnEndOfAlgorithm(self):
-        """Log final performance statistics at the end of the backtest"""
-        self.Log("========== OnEndOfAlgorithm ==========")
-        total_trades = self.trade_stats["total_trades"]
-        if total_trades > 0:
-            win_rate = self.trade_stats["winning_trades"] / total_trades * 100
-            net_pnl = self.trade_stats["total_profit"] - self.trade_stats["total_loss"]
-            avg_win = self.trade_stats["total_profit"] / self.trade_stats["winning_trades"] if self.trade_stats["winning_trades"] > 0 else 0
-            avg_loss = self.trade_stats["total_loss"] / self.trade_stats["losing_trades"] if self.trade_stats["losing_trades"] > 0 else 0
-            profit_factor = self.trade_stats["total_profit"] / self.trade_stats["total_loss"] if self.trade_stats["total_loss"] > 0 else float('inf')
-
-            self.Log("---------- OVERALL PERFORMANCE ----------")
-            self.Log(f"Parameters: DTE {self.dte_min}-{self.dte_max}, Delta {self.target_delta}, SL {self.sl_percent*100:.0f}%, TP {self.tp_percent*100:.0f}%, Max Alloc {self.max_allocation*100:.0f}%")
-            self.Log(f"Total Closing Fills: {total_trades}")
-            self.Log(f"Win Rate (based on fills): {win_rate:.2f}%")
-            self.Log(f"Net P&L: ${net_pnl:.2f}")
-            self.Log(f"Profit Factor: {profit_factor:.2f}")
-            self.Log(f"Average Winning Fill P&L: ${avg_win:.2f}")
-            self.Log(f"Average Losing Fill P&L: ${avg_loss:.2f}")
-            self.Log(f"Largest Winning Fill P&L: ${self.trade_stats['largest_win']:.2f}")
-            self.Log(f"Largest Losing Fill P&L: ${self.trade_stats['largest_loss']:.2f}")
-
-            self.Log("---------- TICKER PERFORMANCE ----------")
-            sorted_tickers = sorted(self.ticker_stats.items(), key=lambda item: item[1]['total_trades'], reverse=True)
-            for ticker, stats in sorted_tickers:
-                if stats['total_trades'] > 0:
-                    ticker_win_rate = stats["winning_trades"] / stats["total_trades"] * 100
-                    ticker_profit_factor = stats["total_profit"] / stats["total_loss"] if stats["total_loss"] > 0 else float('inf')
-                    self.Log(f"{ticker}: Fills={stats['total_trades']}, Win Rate={ticker_win_rate:.2f}%, Net P&L=${stats['net_pnl']:.2f}, Profit Factor={ticker_profit_factor:.2f}")
-                else: self.Log(f"{ticker}: Fills=0")
-            self.Log("----------------------------------------")
-        else:
-            self.Log("No closing trade fills were recorded during the backtest period.")
-
-
-    def ClosePositionsBeforeMarketClose(self):
-        """Liquidate open option positions before market close, especially for 0DTE."""
-        if self.dte_max > 0: return # Only run for 0DTE setting
-
-        try:
-            # --- Get Current Date in Exchange Timezone ---
-            spy_symbol = SymbolCache.Parse("SPY")
-            if not self.Securities.ContainsKey(spy_symbol) or not self.Securities[spy_symbol].HasData:
-                 self.Log("ERROR: SPY security/data not found/ready for EOD check.") # Keep Error Log
-                 return
-            else:
-                 # Preferred method: Get date directly from the exchange clock for SPY
-                 today = self.Securities[spy_symbol].Exchange.Time.date()
-            # --- End Date Acquisition ---
-
-            # Scheduler already triggers this near close, no extra time check needed here normally.
-            # self.Log(f"Market nearing close ({self.Time}). Checking 0DTE. Exchange Date: {today}") # Removed Log
-
-            if not self.current_positions: return # No positions to check
-
-            underlyings_to_liquidate = list(self.current_positions.keys())
-
-            for underlying_symbol in underlyings_to_liquidate:
-                position_info = self.current_positions.get(underlying_symbol)
-                if position_info:
-                     contract_symbol = position_info['contract']
-                     # Check expiry safely - ensure security object exists
-                     if self.Securities.ContainsKey(contract_symbol):
-                         expiry_date = contract_symbol.ID.Date.date()
-                         # Check if the held contract expires today
-                         if (expiry_date - today).days == 0:
-                             # self.Log(f"Closing EOD 0DTE position for {underlying_symbol.Value}") # Removed Log
-                             self.ClosePosition(underlying_symbol) # Use existing close logic
-                     # else: Security might have been delisted or removed
-
-        except Exception as e:
-             # Log any error during the EOD cleanup
-             self.Log(f"ERROR in ClosePositionsBeforeMarketClose: {e}") # Keep Error Log
+        """End of algorithm operations."""
+        self.Log("--- End of Algorithm ---")
+        self.Log(f"Final Portfolio Value: {self.Portfolio.TotalPortfolioValue:,.2f}")
 
