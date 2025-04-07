@@ -5,6 +5,7 @@ from datetime import timedelta, time, datetime # Ensure datetime is imported
 
 # Third-party imports
 import pandas as pd
+import numpy as np # Import numpy for integer conversion
 import pytz # For timezone handling
 
 # QuantConnect imports
@@ -170,22 +171,25 @@ class OptionsSignalBacktest(QCAlgorithm):
         try:
             if market_open_today_et.tzinfo is None: market_open_today_et = ny_zone.localize(market_open_today_et)
             market_open_today_utc = market_open_today_et.astimezone(utc_zone) # Python datetime object
-            # --- Timestamp Conversion ---
-            # Convert to pandas Timestamp for consistent comparison
-            market_open_today_ts = pd.Timestamp(market_open_today_utc)
-            # --- /Timestamp Conversion ---
-        except Exception as e: self.Error(f"Error converting market open ET to UTC/Timestamp: {e}."); return
+            market_open_today_ts = pd.Timestamp(market_open_today_utc) # pd.Timestamp UTC
+            # --- Integer Conversion ---
+            market_open_today_ns = market_open_today_ts.value # Nanoseconds since epoch
+            # --- /Integer Conversion ---
+        except Exception as e: self.Error(f"Error converting market open ET to UTC/Timestamp/Integer: {e}."); return
 
         self.Log(f"--- Market Open Signal Check @ {current_time_et} ET ({self.Time} UTC) ---")
         for ticker in self.tickers:
             ticker_signals = self.signals_df[self.signals_df['Ticker'] == ticker]
-            # Compare Series[pd.Timestamp UTC] < pd.Timestamp [UTC]
+            if ticker_signals.empty: continue # Skip if no signals for this ticker
+
+            # Compare using integer nanoseconds
             try:
-                pre_market_signals = ticker_signals[ticker_signals['Timestamp'] < market_open_today_ts]
-            except TypeError as e:
-                self.Error(f"Comparison TypeError in ProcessLatestPreMarketSignal: {e}")
-                self.Error(f"Comparing Series dtype: {ticker_signals['Timestamp'].dtype}")
-                self.Error(f"with scalar type: {type(market_open_today_ts)} ({market_open_today_ts})")
+                # Convert Series to nanoseconds (int64)
+                timestamp_series_ns = ticker_signals['Timestamp'].astype(np.int64)
+                # Filter using integer comparison
+                pre_market_signals = ticker_signals[timestamp_series_ns < market_open_today_ns]
+            except Exception as e: # Catch potential errors during conversion or comparison
+                self.Error(f"Integer Comparison Error in ProcessLatestPreMarketSignal for {ticker}: {e}")
                 continue # Skip ticker if comparison fails
 
             if not pre_market_signals.empty:
@@ -202,9 +206,13 @@ class OptionsSignalBacktest(QCAlgorithm):
         """Main event handler for processing data and managing trades."""
         if self.IsWarmingUp: return
 
-        # Use pd.Timestamp for internal logic consistency and comparisons
-        # self.Time is datetime UTC, pd.Timestamp converts it correctly
-        current_utc_time_ts = pd.Timestamp(self.Time) # pd.Timestamp UTC
+        # --- Integer Time Conversion ---
+        # Get current time as pd.Timestamp UTC
+        current_utc_time_ts = pd.Timestamp(self.Time)
+        # Convert current time to integer nanoseconds
+        current_utc_time_ns = current_utc_time_ts.value
+        # --- /Integer Time Conversion ---
+
 
         # --- Market Open Check ---
         try:
@@ -222,19 +230,26 @@ class OptionsSignalBacktest(QCAlgorithm):
                  elif start_date_utc.tzinfo != pytz.utc: start_date_utc = start_date_utc.astimezone(pytz.utc)
                  last_processed_time_ts = pd.Timestamp(start_date_utc) # pd.Timestamp
 
-            ticker_signals = self.signals_df[self.signals_df['Ticker'] == ticker]
+            # Convert last processed time to integer nanoseconds
+            last_processed_time_ns = last_processed_time_ts.value
 
-            # Compare Series[pd.Timestamp UTC] with pd.Timestamp UTC for both sides
+            ticker_signals = self.signals_df[self.signals_df['Ticker'] == ticker]
+            if ticker_signals.empty: continue # Skip if no signals for this ticker
+
+            # Compare using integer nanoseconds
             try:
+                # Convert Series column to int64 nanoseconds
+                timestamp_series_ns = ticker_signals['Timestamp'].astype(np.int64)
+                # Filter using integer comparison
                 new_signals = ticker_signals[
-                    (ticker_signals['Timestamp'] > last_processed_time_ts) & # Compare Series[UTC] > Timestamp[UTC]
-                    (ticker_signals['Timestamp'] <= current_utc_time_ts)    # Compare Series[UTC] <= Timestamp[UTC]
+                    (timestamp_series_ns > last_processed_time_ns) &
+                    (timestamp_series_ns <= current_utc_time_ns)
                 ]
-            except TypeError as e:
+            except Exception as e: # Catch potential errors during conversion or comparison
                 # Log detailed error if comparison still fails
-                self.Error(f"Comparison TypeError in OnData: {e}")
+                self.Error(f"Integer Comparison Error in OnData for {ticker}: {e}")
                 self.Error(f"Comparing Series dtype: {ticker_signals['Timestamp'].dtype} ({ticker_signals['Timestamp'].iloc[0] if not ticker_signals.empty else 'N/A'})")
-                self.Error(f"with scalar types: {type(last_processed_time_ts)} ({last_processed_time_ts}) and {type(current_utc_time_ts)} ({current_utc_time_ts})")
+                self.Error(f"with scalar integers: {type(last_processed_time_ns)} ({last_processed_time_ns}) and {type(current_utc_time_ns)} ({current_utc_time_ns})")
                 continue # Skip to next ticker if comparison fails
 
             if not new_signals.empty:
